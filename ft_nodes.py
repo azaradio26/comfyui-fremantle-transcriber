@@ -1,11 +1,15 @@
 from comfy.utils import ProgressBar
+
 import os
 import json
 import time
 import re
+import math
+import threading
 import datetime
 import traceback
 import subprocess
+import tempfile
 from typing import Dict, Any, List
 
 import torch
@@ -14,15 +18,20 @@ import numpy as np
 import srt
 from deep_translator import GoogleTranslator
 
+PLUGIN_VERSION = "v1.0.0"
+
 # ----------------------------
-# Helpers
+# Helpers / Constants
 # ----------------------------
 
 VALID_EXTS = (
     ".mp3", ".wav", ".flac", ".m4a", ".ogg",
     ".mp4", ".mkv", ".avi", ".mov", ".ts",
-    ".aiff", ".aif", ".aac", ".wma"
+    ".aiff", ".aif", ".aac", ".wma",
+    ".mxf",
 )
+
+VIDEO_EXTS = {".mp4", ".mov", ".mxf", ".mkv", ".avi", ".ts"}
 
 ISO_TO_NAME = {
     "en": "English", "pt": "Portuguese", "es": "Spanish", "fr": "French", "de": "German",
@@ -36,11 +45,12 @@ LANG_MAP = {
     "English": "en",
     "Spanish": "es",
     "French": "fr",
-    "Hebrew": "he",    # <-- Whisper Requires "iw"
+    "Hebrew": "he",    # Whisper uses 'he'
     "Arabic": "ar",
     "German": "de",
     "Dutch": "nl",
     "Italian": "it",
+    "Chinese": "zh",
 }
 
 TRANSLATE_MAP = {
@@ -52,12 +62,12 @@ TRANSLATE_MAP = {
     "Italian": "it",
     "Dutch": "nl",
     "Arabic": "ar",
-    "Hebrew": "iw",   # <-- Whisper Requires "iw"
+    "Hebrew": "iw",     # Google uses 'iw'
+    "Chinese": "zh-CN",
 }
 
 def ensure_ffmpeg_on_path():
-    # On macOS, when running via an app bundle, PATH can be limited.
-    # In ComfyUI you usually have a proper shell PATH, but this doesn't hurt.
+    # macOS app bundles can have a limited PATH. Safe no-op elsewhere.
     if os.name != "posix":
         return
     cur = os.environ.get("PATH", "")
@@ -79,15 +89,53 @@ def safe_json_load(s: str, fallback):
 def json_dumps(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
+def extract_audio_to_wav(input_path: str) -> str:
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    tmp.close()
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", input_path,
+        "-vn",
+        "-ac", "1",
+        "-ar", "16000",
+        "-c:a", "pcm_s16le",
+        tmp.name
+    ]
+
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed ({r.returncode}): {r.stderr[-500:]}")
+    return tmp.name
+
+def ffprobe_duration_seconds(path: str) -> float:
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode().strip()
+        return float(out) if out else 0.0
+    except Exception:
+        return 0.0
+
 def ffprobe_has_audio(path: str) -> bool:
-    # Lightweight & fast audio stream check
-    cmd = ["ffprobe", "-v", "error", "-select_streams", "a",
-           "-show_entries", "stream=codec_name", "-of", "csv=p=0", path]
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a",
+        "-show_entries", "stream=codec_name",
+        "-of", "csv=p=0",
+        path
+    ]
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode().strip()
         return bool(out)
     except Exception:
-        # If ffprobe fails, don't block the pipeline
+        # If ffprobe fails, do not block the pipeline.
         return True
 
 def ffmpeg_is_silent(path: str, threshold_db: float = -58.0) -> bool:
@@ -122,46 +170,92 @@ def group_segments(segments: List[Dict[str, Any]], limit: int) -> List[Dict[str,
     blocks = []
     t_texts = []
     t_start = None
+
     for i, seg in enumerate(segments):
         if t_start is None:
-            t_start = float(seg["start"])
+            t_start = float(seg.get("start", 0.0))
+
         t_texts.append((seg.get("text") or "").strip())
+
         if (limit > 0 and len(t_texts) >= limit) or limit == 0 or i == len(segments) - 1:
             blocks.append({
                 "start": t_start,
-                "end": float(seg["end"]),
+                "end": float(seg.get("end", 0.0)),
                 "text": " ".join(t_texts).strip()
             })
             t_texts = []
             t_start = None
+
     return blocks
 
 def split_for_srt(text: str, start: float, end: float, max_w: int = 42):
     import textwrap
     lines = textwrap.wrap(text, width=max_w, break_long_words=False)
+
     if len(lines) <= 2:
-        return [("\n".join(lines),
-                 datetime.timedelta(seconds=start),
-                 datetime.timedelta(seconds=end))]
+        return [(
+            "\n".join(lines),
+            datetime.timedelta(seconds=start),
+            datetime.timedelta(seconds=end)
+        )]
+
     mid = len(lines) // 2
     p1 = "\n".join(lines[:mid])
     p2 = "\n".join(lines[mid:])
+
     t_split = start + (len(p1) / max(1, len(text))) * (end - start)
     return [
         (p1, datetime.timedelta(seconds=start), datetime.timedelta(seconds=t_split)),
         (p2, datetime.timedelta(seconds=t_split), datetime.timedelta(seconds=end)),
     ]
 
-def safe_path(path: str) -> str:
-    if not os.path.exists(path):
-        return path
-    b, e = os.path.splitext(path)
-    c = 1
-    while os.path.exists(f"{b}_v{c}{e}"):
-        c += 1
-    return f"{b}_v{c}{e}"
+_VERSION_RE = re.compile(r"^(?P<stem>.+?)_v(?P<v>\d+)$", re.IGNORECASE)
 
-# Simple in-memory model cache (used for dropdown selection + reuse)
+def safe_path(path: str) -> str:
+    """
+    Versioning rules:
+    - If nothing exists -> use path as-is.
+    - If 'base.ext' exists OR any 'base_vN.ext' exists -> use _v{max+1}
+    - Base file counts as version 1 => first versioned file is _v2 (never _v1).
+    """
+    folder = os.path.dirname(path) or "."
+    base_name = os.path.basename(path)
+    stem, ext = os.path.splitext(base_name)
+    ext_l = ext.lower()
+
+    if not os.path.isdir(folder):
+        return path
+
+    max_v = 0
+
+    try:
+        for fn in os.listdir(folder):
+            s, e = os.path.splitext(fn)
+            if e.lower() != ext_l:
+                continue
+
+            if s == stem:
+                max_v = max(max_v, 1)  # base exists => v1
+                continue
+
+            m = _VERSION_RE.match(s)
+            if m and m.group("stem") == stem:
+                try:
+                    v = int(m.group("v"))
+                    max_v = max(max_v, v)
+                except Exception:
+                    pass
+    except Exception:
+        # If listing fails for any reason, be conservative and return original path.
+        return path
+
+    if max_v == 0:
+        return path
+
+    next_v = max(2, max_v + 1)
+    return os.path.join(folder, f"{stem}_v{next_v}{ext}")
+
+# Simple in-memory model cache
 _MODEL_CACHE: Dict[str, Any] = {}
 
 def load_whisper_model(model_choice: str, custom_path: str, device: str):
@@ -174,11 +268,99 @@ def load_whisper_model(model_choice: str, custom_path: str, device: str):
             raise RuntimeError("Invalid custom model path or file does not exist.")
         model = whisper.load_model(custom_path, device=device)
     else:
-        # Use Whisper named models (if available in the environment)
         model = whisper.load_model(model_choice, device=device)
 
     _MODEL_CACHE[key] = model
     return model
+
+def build_filtered_blocks(blocks, texts, apply_filter: bool):
+    if not apply_filter:
+        out = []
+        for b, t in zip(blocks, texts):
+            out.append({
+                "start": float(b.get("start", 0.0)),
+                "end": float(b.get("end", 0.0)),
+                "text": t or ""
+            })
+        return out
+
+    keep = []
+    last_v = ""
+    for b, t in zip(blocks, texts):
+        start = float(b.get("start", 0.0))
+        end = float(b.get("end", 0.0))
+        dur = end - start
+        if is_hallucination(t, dur, last_v):
+            continue
+        keep.append({"start": start, "end": end, "text": t})
+        last_v = (t or "").strip().lower()
+    return keep
+
+# ----------------------------
+# Node: Info
+# ----------------------------
+class FT_Info:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "show": ("BOOLEAN", {"default": True}),
+                "notes": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": (
+                            "Project Notes (editable):\n"
+                            "- \n"
+                            "- \n"
+                        ),
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("info",)
+    FUNCTION = "run"
+    CATEGORY = "Fremantle/Transcriber"
+
+    def run(self, show: bool, notes: str):
+        if not show:
+            return ("",)
+
+        manual = (
+            f"Fremantle Transcriber for ComfyUI\n"
+            f"Version: {PLUGIN_VERSION}\n"
+            f"=================================\n\n"
+            "STANDARD WORKFLOW\n"
+            "-----------------\n"
+            "1) FT • Load Media Batch\n"
+            "2) FT • Whisper Model (cached)\n"
+            "3) FT • Transcribe Batch\n"
+            "4) FT • Group Segments\n"
+            "5) FT • Translate (Google) OR FT • Translate Multi (Google)\n"
+            "6) FT • Hallucination Filter\n"
+            "7) FT • Export (SRT / TXT / JSON) OR FT • Export Multi\n\n"
+            "KEY SETTINGS\n"
+            "------------\n"
+            "- temperature: 0.0 recommended (deterministic)\n"
+            "- word_timestamps: True = slower, word-level timing\n"
+            "- batch_size (Translate): 10–20 recommended\n"
+            "- Hebrew: Whisper uses 'he', Google uses 'iw'\n\n"
+            "TROUBLESHOOTING\n"
+            "---------------\n"
+            "- If CUDA fails: switch device to CPU or use a smaller model.\n"
+            "- If translation fails: lower batch_size.\n"
+            "- If nodes appear missing: restart ComfyUI.\n\n"
+        )
+
+        notes_clean = (notes or "").strip()
+        if notes_clean:
+            combined = manual + "PROJECT NOTES\n-------------\n" + notes_clean + "\n"
+        else:
+            combined = manual + "PROJECT NOTES\n-------------\n(Empty)\n"
+
+        return (combined,)
 
 # ----------------------------
 # Node 1: Load media batch
@@ -199,11 +381,12 @@ class FT_LoadMediaBatch:
     CATEGORY = "Fremantle/Transcriber"
 
     def run(self, input_path: str, recursive: bool):
-        p = (input_path or "").strip()
+        p = (input_path or "").strip().strip('"').strip("'")
         if not p:
-            return (json_dumps({"files": [], "error": "Empty input path"}),)
+            raise RuntimeError("FT_LoadMediaBatch: Empty input_path.")
 
         files = []
+
         if os.path.isfile(p):
             if p.lower().endswith(VALID_EXTS):
                 files.append(p)
@@ -219,12 +402,23 @@ class FT_LoadMediaBatch:
                     fp = os.path.join(p, n)
                     if os.path.isfile(fp) and fp.lower().endswith(VALID_EXTS):
                         files.append(fp)
+        else:
+            raise RuntimeError(f"FT_LoadMediaBatch: Path does not exist: {p}")
 
         files.sort()
+
+        if not files:
+            raise RuntimeError(
+                "FT_LoadMediaBatch: No valid media files found.\n"
+                f"input_path: {p}\n"
+                f"valid_extensions: {', '.join(VALID_EXTS)}\n"
+                f"recursive: {bool(recursive)}"
+            )
+
         return (json_dumps({"files": files}),)
 
 # ----------------------------
-# Node 2: Whisper model loader (cache)
+# Node 2: Whisper model loader (cached)
 # ----------------------------
 class FT_WhisperModel:
     @classmethod
@@ -243,14 +437,10 @@ class FT_WhisperModel:
     CATEGORY = "Fremantle/Transcriber"
 
     def run(self, model_choice: str, device: str, custom_pt_path: str):
-    # Note: On Mac it's usually CPU; CUDA only on NVIDIA (Windows/Linux).
-    # If CUDA is not available, whisper/torch may fail.
         if device == "cuda" and not torch.cuda.is_available():
             device = "cpu"
 
-        # Load once to validate and cache the model.
-        model = load_whisper_model(model_choice, custom_pt_path, device)
-        _ = model  # just to silence linters
+        _ = load_whisper_model(model_choice, custom_pt_path, device)
 
         return (json_dumps({
             "model_choice": model_choice,
@@ -268,6 +458,7 @@ class FT_TranscribeBatch:
             "required": {
                 "files": ("STRING", {"forceInput": True}),
                 "model_handle": ("STRING", {"forceInput": True}),
+                "extract_audio_for_video": ("BOOLEAN", {"default": True}),
                 "source_language": (list(LANG_MAP.keys()),),
                 "word_timestamps": ("BOOLEAN", {"default": True}),
                 "temperature": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.1}),
@@ -285,52 +476,114 @@ class FT_TranscribeBatch:
     FUNCTION = "run"
     CATEGORY = "Fremantle/Transcriber"
 
-    def run(self,
-            files: str,
-            model_handle: str,
-            source_language: str,
-            word_timestamps: bool,
-            temperature: float,
-            no_speech_threshold: float,
-            logprob_threshold: float,
-            compression_ratio_threshold: float,
-            skip_if_no_audio: bool,
-            skip_if_silent: bool,
-            silent_threshold_db: float
-            ):
+    def run(
+        self,
+        files: str,
+        model_handle: str,
+        extract_audio_for_video: bool,
+        source_language: str,
+        word_timestamps: bool,
+        temperature: float,
+        no_speech_threshold: float,
+        logprob_threshold: float,
+        compression_ratio_threshold: float,
+        skip_if_no_audio: bool,
+        skip_if_silent: bool,
+        silent_threshold_db: float,
+    ):
+        STEP_SEC = 2.0  # smooth progress update interval
 
         files_obj = safe_json_load(files, {})
-        files = files_obj.get("files", []) if isinstance(files_obj, dict) else []
-        mh = safe_json_load(model_handle, {})
+        file_list = files_obj.get("files", []) if isinstance(files_obj, dict) else []
 
+        if not file_list:
+            raise RuntimeError(
+                "FT_TranscribeBatch: No files to process.\n"
+                "Check FT_LoadMediaBatch input_path (path missing, empty, or no valid media extensions)."
+            )
+
+        missing = [p for p in file_list if not os.path.exists(p)]
+        if missing:
+            show = "\n".join(missing[:8])
+            more = "" if len(missing) <= 8 else f"\n... (+{len(missing) - 8} more)"
+            raise RuntimeError(
+                "FT_TranscribeBatch: Some input files do not exist on disk:\n"
+                f"{show}{more}\n"
+                "Fix the input_path or re-run FT_LoadMediaBatch."
+            )
+
+        mh = safe_json_load(model_handle, {})
         model_choice = mh.get("model_choice", "large-v3")
         custom_pt_path = mh.get("custom_pt_path", "")
         device = mh.get("device", "cpu")
 
         model = load_whisper_model(model_choice, custom_pt_path, device)
-
         forced = LANG_MAP.get(source_language, None)
 
+        # Progress estimation
+        per_file_steps = []
+        for p in file_list:
+            dur = ffprobe_duration_seconds(p)
+            steps = max(1, int(math.ceil(dur / STEP_SEC))) if dur > 0 else 1
+            per_file_steps.append(steps)
+
+        total_steps = sum(per_file_steps) if per_file_steps else 1
+        pbar = ProgressBar(max(1, total_steps))
+
         results = []
-        for path in files:
-            item = {"path": path}
+
+        def smooth_updater(target_steps: int, stop_event: threading.Event, done_counter: dict):
+            limit = max(0, target_steps - 1)
+            while not stop_event.is_set() and done_counter["done"] < limit:
+                pbar.update(1)
+                done_counter["done"] += 1
+                time.sleep(STEP_SEC)
+
+        for path, file_steps in zip(file_list, per_file_steps):
+            wav_path = None
+            stop_event = threading.Event()
+            done_counter = {"done": 0}
+            t = None
+
             try:
                 if skip_if_no_audio and not ffprobe_has_audio(path):
                     results.append({"path": path, "status": "EMPTY", "reason": "no_audio"})
-                    continue
-                if skip_if_silent and ffmpeg_is_silent(path, threshold_db=float(silent_threshold_db)):
-                    results.append({"path": path, "status": "EMPTY", "reason": "silent"})
+                    pbar.update(file_steps)
                     continue
 
-                audio = whisper.load_audio(path).astype(np.float32)
+                if skip_if_silent and ffmpeg_is_silent(path, threshold_db=float(silent_threshold_db)):
+                    results.append({"path": path, "status": "EMPTY", "reason": "silent"})
+                    pbar.update(file_steps)
+                    continue
+
+                if file_steps > 1:
+                    t = threading.Thread(
+                        target=smooth_updater,
+                        args=(file_steps, stop_event, done_counter),
+                        daemon=True
+                    )
+                    t.start()
+
+                ext = os.path.splitext(path)[1].lower()
+
+                # For video/container formats (incl. MXF), extract WAV for reliability.
+                if extract_audio_for_video and ext in VIDEO_EXTS:
+                    wav_path = extract_audio_to_wav(path)
+                    audio_src = wav_path
+                else:
+                    audio_src = path
+
+                audio = whisper.load_audio(audio_src).astype(np.float32)
 
                 detected = None
                 if not forced:
                     audio_trimmed = whisper.pad_or_trim(audio)
-                    mel = whisper.log_mel_spectrogram(audio_trimmed, n_mels=model.dims.n_mels).to(model.device)
+                    mel = whisper.log_mel_spectrogram(
+                        audio_trimmed,
+                        n_mels=model.dims.n_mels
+                    ).to(model.device)
                     _, probs = model.detect_language(mel)
-                    iso = max(probs, key=probs.get)
-                    detected = iso
+                    detected = max(probs, key=probs.get)
 
                 use_fp16 = (device == "cuda")
 
@@ -362,10 +615,25 @@ class FT_TranscribeBatch:
                     "trace": traceback.format_exc()
                 })
 
+            finally:
+                if t is not None:
+                    stop_event.set()
+                    t.join(timeout=1.0)
+
+                remaining = max(0, file_steps - done_counter["done"])
+                if remaining:
+                    pbar.update(remaining)
+
+                if wav_path and os.path.exists(wav_path):
+                    try:
+                        os.remove(wav_path)
+                    except Exception:
+                        pass
+
         return (json_dumps({"items": results}),)
 
 # ----------------------------
-# Node 4: Group segments (movie/group10/group20/custom limit)
+# Node 4: Group segments
 # ----------------------------
 class FT_GroupSegments:
     @classmethod
@@ -401,6 +669,7 @@ class FT_GroupSegments:
             if it.get("status") != "OK":
                 out.append(it)
                 continue
+
             segs = it.get("segments", [])
             blocks = group_segments(segs, limit)
             out.append({
@@ -412,7 +681,7 @@ class FT_GroupSegments:
         return (json_dumps({"items": out}),)
 
 # ----------------------------
-# Node 5: Translate Google (batch blocks)
+# Node 5: Translate Google (single)
 # ----------------------------
 class FT_TranslateGoogle:
     @classmethod
@@ -420,7 +689,7 @@ class FT_TranslateGoogle:
         return {
             "required": {
                 "grouped": ("STRING", {"forceInput": True}),
-                "target_language": (["English", "Portuguese", "Spanish", "French", "German", "Italian", "Dutch", "Arabic", "Hebrew"],),
+                "target_language": (list(TRANSLATE_MAP.keys()),),
                 "batch_size": ("INT", {"default": 10, "min": 1, "max": 50}),
             }
         }
@@ -437,30 +706,45 @@ class FT_TranslateGoogle:
         tgt_code = TRANSLATE_MAP.get(target_language, "en")
         translator = GoogleTranslator(source="auto", target=tgt_code)
 
+        # Progress counts batches for OK items.
+        total_batches = 0
+        for it in items:
+            if it.get("status") == "OK":
+                blocks = it.get("blocks", []) or []
+                total_batches += len(range(0, len(blocks), int(batch_size))) or 1
+
+        pbar = ProgressBar(max(1, total_batches))
+
         out = []
         for it in items:
             if it.get("status") != "OK":
                 out.append(it)
                 continue
 
-            blocks = it.get("blocks", [])
+            blocks = it.get("blocks", []) or []
             texts = [b.get("text", "") for b in blocks]
 
             translated = []
             total = len(texts)
             for i in range(0, total, int(batch_size)):
-                chunk = texts[i:i+int(batch_size)]
+                chunk = texts[i:i + int(batch_size)]
                 try:
-                    got = translator.translate("\n".join(chunk)).split("\n")
-                    if len(got) == len(chunk):
-                        translated.extend(got)
+                    got = translator.translate("\n".join(chunk))
+                    got_lines = (got or "").split("\n") if got else []
+                    if len(got_lines) == len(chunk):
+                        translated.extend(got_lines)
                     else:
-                        # fallback line-by-line
                         for x in chunk:
-                            translated.append(translator.translate(x))
+                            translated.append(translator.translate(x) if x.strip() else x)
                 except Exception:
                     for x in chunk:
-                        translated.append(translator.translate(x))
+                        try:
+                            translated.append(translator.translate(x) if x.strip() else x)
+                        except Exception:
+                            translated.append(x)
+
+                time.sleep(0.1)
+                pbar.update(1)
 
             out.append({
                 **it,
@@ -471,7 +755,10 @@ class FT_TranslateGoogle:
             })
 
         return (json_dumps({"items": out}),)
-        
+
+# ----------------------------
+# Node 6: Translate Multi Google
+# ----------------------------
 class FT_TranslateMultiGoogle:
     @classmethod
     def INPUT_TYPES(cls):
@@ -483,13 +770,14 @@ class FT_TranslateMultiGoogle:
                 # Checkboxes (UI labels)
                 "English": ("BOOLEAN", {"default": True}),
                 "Portuguese": ("BOOLEAN", {"default": False}),
-                "Spanish": ("BOOLEAN", {"default": True}),
-                "French": ("BOOLEAN", {"default": True}),
+                "Spanish": ("BOOLEAN", {"default": False}),
+                "French": ("BOOLEAN", {"default": False}),
                 "German": ("BOOLEAN", {"default": False}),
                 "Italian": ("BOOLEAN", {"default": False}),
                 "Dutch": ("BOOLEAN", {"default": False}),
                 "Arabic": ("BOOLEAN", {"default": False}),
                 "Hebrew": ("BOOLEAN", {"default": False}),
+                "Chinese": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -502,23 +790,21 @@ class FT_TranslateMultiGoogle:
         obj = safe_json_load(grouped, {})
         items = obj.get("items", []) if isinstance(obj, dict) else []
 
-        # Deterministic order (nice for UI + exports)
-        order = ["English", "Portuguese", "Spanish", "French", "German", "Italian", "Dutch", "Arabic", "Hebrew"]
+        order = ["English", "Portuguese", "Spanish", "French", "German", "Italian", "Dutch", "Arabic", "Hebrew", "Chinese"]
+        selected_langs = [l for l in order if bool(flags.get(l, False)) and l in TRANSLATE_MAP]
 
-        supported = set(TRANSLATE_MAP.keys())
+        if not selected_langs:
+            raise RuntimeError(
+                "FT_TranslateMultiGoogle: No target languages selected. Enable at least one checkbox."
+            )
 
-        # flags will contain: {"English": True, "French": False, ...}
-        langs = [l for l in order if bool(flags.get(l, False)) and l in supported]
+        total_batches = 0
+        for it in items:
+            if it.get("status") == "OK":
+                blocks = it.get("blocks", []) or []
+                total_batches += len(range(0, len(blocks), int(batch_size))) or 1
 
-        if not langs:
-            return (json_dumps({
-                "items": items,
-                "error": "No target languages selected. Enable at least one language checkbox.",
-                "supported_languages": sorted(list(supported)),
-            }),)
-
-        total_blocks = sum(len(it.get("blocks", [])) for it in items if it.get("status") == "OK")
-        total_steps = max(1, total_blocks * len(langs))
+        total_steps = max(1, total_batches * len(selected_langs))
         pbar = ProgressBar(total_steps)
 
         out = []
@@ -527,94 +813,51 @@ class FT_TranslateMultiGoogle:
                 out.append(it)
                 continue
 
-            blocks = it.get("blocks", [])
-            texts = [b.get("text", "") for b in blocks]
+            blocks = it.get("blocks", []) or []
+            original_texts = [b.get("text", "") for b in blocks]
 
-            translated_by_lang = {}
-            target_codes_by_lang = {}
+            multi_translations = {}  # {lang_code: [translated lines...]}
 
-            for lang in langs:
-                tgt_code = TRANSLATE_MAP.get(lang, "en")
-                target_codes_by_lang[lang] = tgt_code
-
+            for lang in selected_langs:
+                tgt_code = TRANSLATE_MAP[lang]
                 translator = GoogleTranslator(source="auto", target=tgt_code)
 
                 translated = []
-                for i in range(0, len(texts), int(batch_size)):
-                    chunk = texts[i:i + int(batch_size)]
+                total = len(original_texts)
+
+                for i in range(0, total, int(batch_size)):
+                    chunk = original_texts[i:i + int(batch_size)]
                     try:
-                        got = translator.translate("\n".join(chunk)).split("\n")
-                        if len(got) == len(chunk):
-                            translated.extend(got)
+                        got = translator.translate("\n".join(chunk))
+                        got_lines = (got or "").split("\n") if got else []
+                        if len(got_lines) == len(chunk):
+                            translated.extend(got_lines)
                         else:
                             for x in chunk:
-                                translated.append(translator.translate(x))
+                                translated.append(translator.translate(x) if x.strip() else x)
                     except Exception:
                         for x in chunk:
-                            translated.append(translator.translate(x))
+                            try:
+                                translated.append(translator.translate(x) if x.strip() else x)
+                            except Exception:
+                                translated.append(x)
 
-                    pbar.update(len(chunk))
+                    time.sleep(0.1)
+                    pbar.update(1)
 
-                translated_by_lang[lang] = translated
+                multi_translations[tgt_code] = translated
 
             out.append({
                 **it,
                 "translate_multi": True,
-                "target_languages": langs,
-                "target_codes_by_lang": target_codes_by_lang,
-                "translated_texts_by_lang": translated_by_lang,
-            })
-
-        return (json_dumps({"items": out}),)
-        
-class FT_SelectTranslationLanguage:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "multi_translated": ("STRING", {"forceInput": True}),
-                "language": (list(TRANSLATE_MAP.keys()),),
-            }
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("translated",)
-    FUNCTION = "run"
-    CATEGORY = "Fremantle/Transcriber"
-
-    def run(self, multi_translated: str, language: str):
-        obj = safe_json_load(multi_translated, {})
-        items = obj.get("items", []) if isinstance(obj, dict) else []
-
-        out = []
-        for it in items:
-            if it.get("status") != "OK":
-                out.append(it)
-                continue
-
-            by_lang = it.get("translated_texts_by_lang", {}) or {}
-            codes = it.get("target_codes_by_lang", {}) or {}
-
-            translated_texts = by_lang.get(language, None)
-            tgt_code = codes.get(language, TRANSLATE_MAP.get(language, "en"))
-
-            # If not found, pass-through without translation (still works)
-            if not translated_texts:
-                blocks = it.get("blocks", [])
-                translated_texts = [b.get("text", "") for b in blocks]
-
-            out.append({
-                **it,
-                "translate": True,
-                "target_language": language,
-                "target_code": tgt_code,
-                "translated_texts": translated_texts,
+                "target_languages": selected_langs,
+                "translated_texts_by_lang_code": multi_translations,  # {code: texts}
             })
 
         return (json_dumps({"items": out}),)
 
 # ----------------------------
-# Node 6: Hallucination filter (on translated_texts OR original blocks)
+# Node 7: Hallucination filter (single)
 # ----------------------------
 class FT_HallucinationFilter:
     @classmethod
@@ -644,28 +887,18 @@ class FT_HallucinationFilter:
                 out.append(it)
                 continue
 
-            blocks = it.get("blocks", [])
+            blocks = it.get("blocks", []) or []
             texts = it.get("translated_texts", None)
-
-            # if no translation is available, use the original text
             if not texts:
                 texts = [b.get("text", "") for b in blocks]
 
-            keep = []
-            last_v = ""
-            for b, t in zip(blocks, texts):
-                dur = float(b.get("end", 0)) - float(b.get("start", 0))
-                if is_hallucination(t, dur, last_v):
-                    continue
-                keep.append({"start": b["start"], "end": b["end"], "text": t})
-                last_v = (t or "").strip().lower()
-
-            out.append({**it, "filtered_blocks": keep})
+            filtered_blocks = build_filtered_blocks(blocks, texts, apply_filter=True)
+            out.append({**it, "filtered_blocks": filtered_blocks})
 
         return (json_dumps({"items": out}),)
 
 # ----------------------------
-# Node 7: Export (SRT / TXT / JSON segments)
+# Node 8: Export (SRT / TXT / JSON) - single
 # ----------------------------
 class FT_ExportSubtitles:
     @classmethod
@@ -689,25 +922,26 @@ class FT_ExportSubtitles:
         obj = safe_json_load(filtered, {})
         items = obj.get("items", []) if isinstance(obj, dict) else []
 
-        out_dir = (output_dir or "").strip()
+        out_dir = (output_dir or "").strip().strip('"').strip("'")
         if not out_dir:
-            return (json_dumps({"outputs": [], "error": "Empty output directory"}),)
+            raise RuntimeError("FT_ExportSubtitles: Empty output_dir.")
 
         os.makedirs(out_dir, exist_ok=True)
 
         outputs = []
         for it in items:
             path = it.get("path")
-            status = it.get("status")
-            if status != "OK":
-                outputs.append({"path": path, "status": status, "skipped": True})
+            if it.get("status") != "OK":
+                outputs.append({"path": path, "status": it.get("status"), "skipped": True})
                 continue
 
             base = os.path.splitext(os.path.basename(path))[0]
-
             suffix = ""
             if add_lang_suffix and it.get("translate") and it.get("target_code"):
                 suffix = f"_{it['target_code']}"
+
+            # Prefer filtered_blocks, fall back to blocks
+            blocks_to_export = it.get("filtered_blocks") or it.get("blocks") or []
 
             if format == "JSON":
                 fn = safe_path(os.path.join(out_dir, base + suffix + ".json"))
@@ -725,21 +959,25 @@ class FT_ExportSubtitles:
 
             if format == "TXT":
                 fn = safe_path(os.path.join(out_dir, base + suffix + ".txt"))
-                blocks = it.get("filtered_blocks", [])
                 with open(fn, "w", encoding="utf-8") as f:
-                    for b in blocks:
-                        f.write(b.get("text", "").strip() + "\n")
+                    for b in blocks_to_export:
+                        txt = (b.get("text") or "").strip()
+                        if txt:
+                            f.write(txt + "\n")
                 outputs.append({"path": path, "out": fn, "format": "TXT"})
                 continue
 
             # SRT
             fn = safe_path(os.path.join(out_dir, base + suffix + ".srt"))
-            blocks = it.get("filtered_blocks", [])
             subs = []
             idx = 1
-            for b in blocks:
+            for b in blocks_to_export:
                 txt = (b.get("text") or "").strip()
-                for pt, ps, pe in split_for_srt(txt, float(b["start"]), float(b["end"])):
+                if not txt:
+                    continue
+                for pt, ps, pe in split_for_srt(txt, float(b.get("start", 0.0)), float(b.get("end", 0.0))):
+                    if not pt.strip():
+                        continue
                     subs.append(srt.Subtitle(idx, ps, pe, pt))
                     idx += 1
             with open(fn, "w", encoding="utf-8") as f:
@@ -747,19 +985,21 @@ class FT_ExportSubtitles:
             outputs.append({"path": path, "out": fn, "format": "SRT"})
 
         return (json_dumps({"outputs": outputs}),)
-        
+
+# ----------------------------
+# Node 9: Export Multi (SRT/TXT/JSON) with hallucination filter + safe_path versioning
+# ----------------------------
 class FT_ExportMultiSubtitles:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                # accepts output of FT_TranslateMultiGoogle
                 "multi_translated": ("STRING", {"forceInput": True}),
                 "output_dir": ("STRING", {"default": "", "multiline": False}),
                 "format": (["SRT", "TXT", "JSON"],),
                 "add_lang_suffix": ("BOOLEAN", {"default": True}),
-                # optional: apply hallucination filter during export
                 "apply_hallucination_filter": ("BOOLEAN", {"default": True}),
+                "export_original_language": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -776,213 +1016,170 @@ class FT_ExportMultiSubtitles:
         format: str,
         add_lang_suffix: bool,
         apply_hallucination_filter: bool,
+        export_original_language: bool,
     ):
         obj = safe_json_load(multi_translated, {})
         items = obj.get("items", []) if isinstance(obj, dict) else []
 
-        out_dir = (output_dir or "").strip()
+        out_dir = (output_dir or "").strip().strip('"').strip("'")
         if not out_dir:
-            return (json_dumps({"outputs": [], "error": "Empty output directory"}),)
-
+            raise RuntimeError("FT_ExportMultiSubtitles: Empty output_dir.")
         os.makedirs(out_dir, exist_ok=True)
-
-        # compute total steps for progress:
-        # sum over OK items: (num_blocks * num_languages)
-        total_steps = 0
-        for it in items:
-            if it.get("status") != "OK":
-                continue
-            blocks = it.get("blocks", [])
-            by_lang = it.get("translated_texts_by_lang", {}) or {}
-            langs = list(by_lang.keys())
-            total_steps += len(blocks) * max(1, len(langs))
-
-        pbar = ProgressBar(max(1, total_steps))
 
         outputs = []
 
         for it in items:
             path = it.get("path")
-            status = it.get("status")
-
-            if status != "OK":
-                outputs.append({"path": path, "status": status, "skipped": True})
+            if it.get("status") != "OK":
+                outputs.append({"path": path, "status": it.get("status"), "skipped": True})
                 continue
-
-            blocks = it.get("blocks", [])
-            by_lang = it.get("translated_texts_by_lang", {}) or {}
-            codes = it.get("target_codes_by_lang", {}) or {}
-
-            # If for some reason it isn't multi, fall back to single-style export
-            if not by_lang:
-                # Try single translated_texts, else original
-                texts = it.get("translated_texts", None)
-                if not texts:
-                    texts = [b.get("text", "") for b in blocks]
-
-                filtered_blocks = self._build_filtered_blocks(
-                    blocks=blocks,
-                    texts=texts,
-                    apply_filter=apply_hallucination_filter
-                )
-
-                out_files = self._export_one_language(
-                    path=path,
-                    detected_language=it.get("detected_language"),
-                    segments=it.get("segments", []),
-                    blocks=blocks,
-                    filtered_blocks=filtered_blocks,
-                    output_dir=out_dir,
-                    format=format,
-                    suffix=""  # no language suffix available
-                )
-
-                outputs.extend(out_files)
-                # progress
-                pbar.update(len(blocks))
-                continue
-
-            # Multi-language export
-            # Ensure deterministic order (use target_languages if present)
-            lang_order = it.get("target_languages", None)
-            if isinstance(lang_order, list) and lang_order:
-                langs = [l for l in lang_order if l in by_lang]
-            else:
-                langs = list(by_lang.keys())
 
             base = os.path.splitext(os.path.basename(path))[0]
+            blocks = it.get("blocks", []) or []
+            if not blocks:
+                outputs.append({"path": path, "status": "ERROR", "error": "No blocks found to export."})
+                continue
 
-            for lang in langs:
-                texts = by_lang.get(lang, []) or []
-                tgt_code = codes.get(lang, TRANSLATE_MAP.get(lang, "en"))
+            # Multi translations (new format from FT_TranslateMultiGoogle):
+            # translated_texts_by_lang_code: { "en": [...], "es": [...], ... }
+            by_code = it.get("translated_texts_by_lang_code", {}) or {}
+            target_langs = it.get("target_languages", None)
+            if isinstance(target_langs, list) and target_langs:
+                # Map language names -> codes for stable order if present
+                ordered_codes = []
+                for name in target_langs:
+                    code = TRANSLATE_MAP.get(name)
+                    if code and code in by_code:
+                        ordered_codes.append(code)
+                codes = ordered_codes if ordered_codes else list(by_code.keys())
+            else:
+                codes = list(by_code.keys())
 
-                filtered_blocks = self._build_filtered_blocks(
-                    blocks=blocks,
-                    texts=texts if texts else [b.get("text", "") for b in blocks],
-                    apply_filter=apply_hallucination_filter
-                )
+            # Optionally export original language
+            if export_original_language:
+                suffix = "_original" if add_lang_suffix else ""
+                if format == "SRT":
+                    fn = safe_path(os.path.join(out_dir, base + suffix + ".srt"))
+                    subs = []
+                    idx = 1
+                    for b in blocks:
+                        txt = (b.get("text") or "").strip()
+                        if not txt:
+                            continue
+                        for pt, ps, pe in split_for_srt(txt, float(b.get("start", 0.0)), float(b.get("end", 0.0))):
+                            if not pt.strip():
+                                continue
+                            subs.append(srt.Subtitle(idx, ps, pe, pt))
+                            idx += 1
+                    with open(fn, "w", encoding="utf-8") as f:
+                        f.write(srt.compose(subs))
+                    outputs.append({"path": path, "out": fn, "format": "SRT", "target_code": "original"})
+                elif format == "TXT":
+                    fn = safe_path(os.path.join(out_dir, base + suffix + ".txt"))
+                    with open(fn, "w", encoding="utf-8") as f:
+                        for b in blocks:
+                            txt = (b.get("text") or "").strip()
+                            if txt:
+                                f.write(txt + "\n")
+                    outputs.append({"path": path, "out": fn, "format": "TXT", "target_code": "original"})
+                else:  # JSON
+                    fn = safe_path(os.path.join(out_dir, base + suffix + ".json"))
+                    payload = {
+                        "path": path,
+                        "detected_language": it.get("detected_language"),
+                        "segments": it.get("segments", []),
+                        "blocks": blocks,
+                    }
+                    with open(fn, "w", encoding="utf-8") as f:
+                        f.write(json_dumps(payload))
+                    outputs.append({"path": path, "out": fn, "format": "JSON", "target_code": "original"})
+
+            # Export each translation code
+            for code in codes:
+                texts = by_code.get(code, []) or []
+                if not texts:
+                    continue
+
+                # Ensure same length pairing; if mismatch, pad with original
+                if len(texts) < len(blocks):
+                    for i in range(len(texts), len(blocks)):
+                        texts.append(blocks[i].get("text", ""))
+                elif len(texts) > len(blocks):
+                    texts = texts[:len(blocks)]
+
+                filtered_blocks = build_filtered_blocks(blocks, texts, apply_filter=bool(apply_hallucination_filter))
 
                 suffix = ""
-                if add_lang_suffix and tgt_code:
-                    suffix = f"_{tgt_code}"
+                if add_lang_suffix and code:
+                    suffix = f"_{code}"
 
-                out_files = self._export_one_language(
-                    path=path,
-                    detected_language=it.get("detected_language"),
-                    segments=it.get("segments", []),
-                    blocks=blocks,
-                    filtered_blocks=filtered_blocks,
-                    output_dir=out_dir,
-                    format=format,
-                    suffix=suffix
-                )
+                if format == "JSON":
+                    fn = safe_path(os.path.join(out_dir, base + suffix + ".json"))
+                    payload = {
+                        "path": path,
+                        "target_code": code,
+                        "blocks": blocks,
+                        "filtered_blocks": filtered_blocks,
+                    }
+                    with open(fn, "w", encoding="utf-8") as f:
+                        f.write(json_dumps(payload))
+                    outputs.append({"path": path, "out": fn, "format": "JSON", "target_code": code})
+                    continue
 
-                # add metadata for clarity
-                for o in out_files:
-                    o["target_language"] = lang
-                    o["target_code"] = tgt_code
-                    o["base"] = base
+                if format == "TXT":
+                    fn = safe_path(os.path.join(out_dir, base + suffix + ".txt"))
+                    with open(fn, "w", encoding="utf-8") as f:
+                        for b in filtered_blocks:
+                            txt = (b.get("text") or "").strip()
+                            if txt:
+                                f.write(txt + "\n")
+                    outputs.append({"path": path, "out": fn, "format": "TXT", "target_code": code})
+                    continue
 
-                outputs.extend(out_files)
-
-                # progress: 1 step per block for each language
-                pbar.update(len(blocks))
+                # SRT
+                fn = safe_path(os.path.join(out_dir, base + suffix + ".srt"))
+                subs = []
+                idx = 1
+                for b in filtered_blocks:
+                    txt = (b.get("text") or "").strip()
+                    if not txt:
+                        continue
+                    for pt, ps, pe in split_for_srt(txt, float(b.get("start", 0.0)), float(b.get("end", 0.0))):
+                        if not pt.strip():
+                            continue
+                        subs.append(srt.Subtitle(idx, ps, pe, pt))
+                        idx += 1
+                with open(fn, "w", encoding="utf-8") as f:
+                    f.write(srt.compose(subs))
+                outputs.append({"path": path, "out": fn, "format": "SRT", "target_code": code})
 
         return (json_dumps({"outputs": outputs}),)
-
-    def _build_filtered_blocks(self, blocks, texts, apply_filter: bool):
-        if not apply_filter:
-            # keep timings, just assign text
-            out = []
-            for b, t in zip(blocks, texts):
-                out.append({"start": b["start"], "end": b["end"], "text": t})
-            return out
-
-        keep = []
-        last_v = ""
-        for b, t in zip(blocks, texts):
-            dur = float(b.get("end", 0)) - float(b.get("start", 0))
-            if is_hallucination(t, dur, last_v):
-                continue
-            keep.append({"start": b["start"], "end": b["end"], "text": t})
-            last_v = (t or "").strip().lower()
-        return keep
-
-    def _export_one_language(
-        self,
-        path: str,
-        detected_language,
-        segments,
-        blocks,
-        filtered_blocks,
-        output_dir: str,
-        format: str,
-        suffix: str
-    ):
-        base = os.path.splitext(os.path.basename(path))[0]
-        out_files = []
-
-        if format == "JSON":
-            fn = safe_path(os.path.join(output_dir, base + suffix + ".json"))
-            payload = {
-                "path": path,
-                "detected_language": detected_language,
-                "segments": segments or [],
-                "blocks": blocks or [],
-                "filtered_blocks": filtered_blocks or [],
-            }
-            with open(fn, "w", encoding="utf-8") as f:
-                f.write(json_dumps(payload))
-            out_files.append({"path": path, "out": fn, "format": "JSON"})
-            return out_files
-
-        if format == "TXT":
-            fn = safe_path(os.path.join(output_dir, base + suffix + ".txt"))
-            with open(fn, "w", encoding="utf-8") as f:
-                for b in (filtered_blocks or []):
-                    f.write((b.get("text", "") or "").strip() + "\n")
-            out_files.append({"path": path, "out": fn, "format": "TXT"})
-            return out_files
-
-        # SRT
-        fn = safe_path(os.path.join(output_dir, base + suffix + ".srt"))
-        subs = []
-        idx = 1
-        for b in (filtered_blocks or []):
-            txt = (b.get("text") or "").strip()
-            for pt, ps, pe in split_for_srt(txt, float(b["start"]), float(b["end"])):
-                subs.append(srt.Subtitle(idx, ps, pe, pt))
-                idx += 1
-        with open(fn, "w", encoding="utf-8") as f:
-            f.write(srt.compose(subs))
-        out_files.append({"path": path, "out": fn, "format": "SRT"})
-        return out_files
 
 # ----------------------------
 # Node registration
 # ----------------------------
 NODE_CLASS_MAPPINGS = {
+    "FT_Info": FT_Info,
     "FT_LoadMediaBatch": FT_LoadMediaBatch,
     "FT_WhisperModel": FT_WhisperModel,
     "FT_TranscribeBatch": FT_TranscribeBatch,
     "FT_GroupSegments": FT_GroupSegments,
     "FT_TranslateGoogle": FT_TranslateGoogle,
+    "FT_TranslateMultiGoogle": FT_TranslateMultiGoogle,
     "FT_HallucinationFilter": FT_HallucinationFilter,
     "FT_ExportSubtitles": FT_ExportSubtitles,
-    "FT_TranslateMultiGoogle": FT_TranslateMultiGoogle,
-    "FT_SelectTranslationLanguage": FT_SelectTranslationLanguage,
     "FT_ExportMultiSubtitles": FT_ExportMultiSubtitles,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "FT_Info": "FT • Info",
     "FT_LoadMediaBatch": "FT • Load Media Batch",
     "FT_WhisperModel": "FT • Whisper Model (cached)",
     "FT_TranscribeBatch": "FT • Transcribe Batch",
     "FT_GroupSegments": "FT • Group Segments",
     "FT_TranslateGoogle": "FT • Translate (Google)",
+    "FT_TranslateMultiGoogle": "FT • Translate Multi (Google)",
     "FT_HallucinationFilter": "FT • Hallucination Filter",
     "FT_ExportSubtitles": "FT • Export (SRT/TXT/JSON)",
-    "FT_TranslateMultiGoogle": "FT • Translate Multi (Google)",
-    "FT_SelectTranslationLanguage": "FT • Select Translation Language",
     "FT_ExportMultiSubtitles": "FT • Export Multi (SRT/TXT/JSON)",
 }
