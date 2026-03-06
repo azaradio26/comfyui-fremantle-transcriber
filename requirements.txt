@@ -1,0 +1,5 @@
+openai-whisper
+numpy
+srt
+deep-translator
+ffmpeg-python
