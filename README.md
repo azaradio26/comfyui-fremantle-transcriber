@@ -17,7 +17,7 @@ Custom ComfyUI nodes for:
 2. Open `custom_nodes`
 3. Clone this repository:
 
-git clone https://github.com/YOURNAME/comfyui-fremantle-transcriber.git
+git clone https://github.com/azaradio26/comfyui-fremantle-transcriber.git
 
 4. Install requirements:
 
