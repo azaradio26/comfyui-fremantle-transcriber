@@ -19,11 +19,19 @@ Custom ComfyUI nodes for:
 
 git clone https://github.com/azaradio26/comfyui-fremantle-transcriber.git
 
-4. Install requirements:
+4. Install Python dependencies using the same Python environment used by ComfyUI
 
-pip install -r custom_nodes/comfyui-fremantle-transcriber/requirements.txt
+python -m pip install -r custom_nodes/comfyui-fremantle-transcriber/requirements.txt
 
-5. Restart ComfyUI
+5. Make sure ffmpeg and ffprobe are installed on your system
+
+6. Restart ComfyUI
+
+Linux / RunPod
+
+Install FFmpeg system binaries:
+
+apt-get update && apt-get install -y ffmpeg
 
 ---
 
