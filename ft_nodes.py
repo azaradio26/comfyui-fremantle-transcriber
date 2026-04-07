@@ -10,6 +10,7 @@ import datetime
 import traceback
 import subprocess
 import tempfile
+import shutil
 from typing import Dict, Any, List
 
 import torch
@@ -79,6 +80,24 @@ def ensure_ffmpeg_on_path():
     os.environ["PATH"] = ":".join(parts)
 
 ensure_ffmpeg_on_path()
+
+def require_ffmpeg_tools():
+    missing = []
+
+    if shutil.which("ffmpeg") is None:
+        missing.append("ffmpeg")
+    if shutil.which("ffprobe") is None:
+        missing.append("ffprobe")
+
+    if missing:
+        missing_txt = ", ".join(missing)
+        raise RuntimeError(
+            "Fremantle Transcriber: required system tool(s) not found: "
+            f"{missing_txt}. "
+            "Please install ffmpeg on the system and ensure both ffmpeg and ffprobe "
+            "are available in PATH. "
+            "Note: pip install -r requirements.txt does not install ffmpeg."
+        )
 
 def safe_json_load(s: str, fallback):
     try:
@@ -491,6 +510,8 @@ class FT_TranscribeBatch:
         skip_if_silent: bool,
         silent_threshold_db: float,
     ):
+        require_ffmpeg_tools()
+        
         STEP_SEC = 2.0  # smooth progress update interval
 
         files_obj = safe_json_load(files, {})
